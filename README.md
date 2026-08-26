@@ -28,7 +28,7 @@ e lembrete — não é um chatbot que responde bonito, é um sistema que executa
 
 **Stack:** Node.js + Express, PostgreSQL, WhatsApp Business Cloud API,
 Google Calendar API (OAuth2 por tenant), Mercado Pago (Pix), OpenRouter para
-roteamento de LLM. PM2, Nginx e Let's Encrypt numa VPS. Mais de 450 testes em Vitest.
+roteamento de LLM. PM2, Nginx e Let's Encrypt numa VPS. Mais de 200 testes em Vitest.
 
 ---
 
