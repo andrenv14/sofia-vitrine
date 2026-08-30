@@ -22,7 +22,7 @@ Sem framework de bot, sem fila externa, sem contêineres. O que essa escolha
 exige em troca — concorrência e falha resolvidas com o banco e com o desenho —
 é o assunto do resto deste README.
 
-![Conversa de agendamento pelo WhatsApp](docs/agendamento-conversa.png)
+![Conversa de agendamento pelo WhatsApp](docs/agendamento-conversa.jpg)
 
 ![Evento criado no Google Calendar do negócio](docs/agendamento-calendar.png)
 
