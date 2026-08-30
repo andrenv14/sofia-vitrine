@@ -1,195 +1,118 @@
 # Sofia — assistente de agendamento por WhatsApp
 
-Estudo de caso de um sistema em produção: uma assistente de IA que atende,
-agenda, cancela, lembra, mostra catálogo, cobra por Pix e passa para humano —
-pelo WhatsApp, com a API oficial da Meta.
+Assistente de IA que atende clientes de pequenos negócios pelo WhatsApp:
+conversa, consulta a agenda real (Google Calendar), marca e cancela horários e
+cobra via Pix. Multi-tenant — cada cliente é um tenant com número, prompt,
+catálogo, profissionais e agenda próprios.
 
-Multi-tenant, com cliente pagante. O código é privado; este repositório mostra
-a arquitetura, as decisões e os trechos que valem ser lidos.
+O código de produção é privado. Este repositório mostra a arquitetura e os
+trechos que valem leitura — escolhidos por mostrarem decisão, não por serem os
+maiores.
 
 ---
 
-## 1. O que é
+## 1. O que é, e a prova de que está no ar
 
-O negócio conecta o próprio número de WhatsApp. O cliente final conversa
-normalmente — sem menu, sem "digite 1 para agendar" — e a assistente resolve.
+Em produção desde **08/08/2026**, numa VPS própria, recebendo e respondendo
+tráfego real pela **API oficial** (WhatsApp Business Platform) — nunca
+automação de WhatsApp Web.
+
+Stack deliberadamente pequena: **Node.js + Express, PostgreSQL, PM2, Nginx**.
+Sem framework de bot, sem fila externa, sem contêineres. O que essa escolha
+exige em troca — concorrência e falha resolvidas com o banco e com o desenho —
+é o assunto do resto deste README.
 
 ![Conversa de agendamento pelo WhatsApp](docs/agendamento-conversa.png)
 
-A pessoa escreve "Quero marcar um horário". A assistente pergunta o dia e o
-turno. Ela responde "Segunda de manhã". A assistente consulta a **agenda real
-do negócio** e oferece os horários livres. Ela responde só "10". A assistente
-confirma com data completa e pede o nome.
-
 ![Evento criado no Google Calendar do negócio](docs/agendamento-calendar.png)
-
-E o agendamento vira evento no Google Calendar do negócio, com serviço, contato
-e lembrete — não é um chatbot que responde bonito, é um sistema que executa.
-
-**Stack:** Node.js + Express, PostgreSQL, WhatsApp Business Cloud API,
-Google Calendar API (OAuth2 por tenant), Mercado Pago (Pix), OpenRouter para
-roteamento de LLM. PM2, Nginx e Let's Encrypt numa VPS. Mais de 200 testes em Vitest.
-
----
 
 ## 2. Arquitetura
 
+O caminho de uma mensagem, com os ramos de falha no lugar em que são tratados:
+
 ```mermaid
 flowchart TD
-    A["WhatsApp Cloud API<br/>(Meta)"] -->|POST /webhook| B{assinatura<br/>HMAC válida?}
-    B -->|não| Z1["401 — payload<br/>descartado"]
-    B -->|sim| C{já processada?<br/>dedup por wamid}
-    C -->|sim| Z2["ignora reentrega"]
-    C -->|não| D{loop-guard<br/>gate de entrada}
-    D -->|contato pausado| Z3["descarta<br/>e loga"]
-    D -->|ok| E["buffer de mensagens<br/>agrupa rajada"]
-    E --> F["roteia por phone_number_id<br/>→ tenant"]
-    F --> G["LLM via OpenRouter<br/>com ferramentas"]
-    G --> H1["consultar horários"]
-    G --> H2["criar/cancelar<br/>agendamento"]
-    G --> H3["mostrar catálogo"]
-    G --> H4["gerar cobrança Pix"]
-    H1 & H2 --> I["Google Calendar<br/>do negócio"]
-    H4 --> J["Mercado Pago"]
-    G --> K{loop-guard<br/>gate de envio}
-    K -->|resposta repetida| Z4["não envia,<br/>pausa contato"]
-    K -->|ok| L["resposta pelo<br/>WhatsApp"]
+    META[WhatsApp Cloud API] -->|POST /webhook| HMAC{assinatura HMAC valida?}
+    HMAC -->|nao| R401[401 - ignorado]
+    HMAC -->|sim| ACK[responde 200 imediatamente]
+    ACK --> DEDUP{wamid ja visto?}
+    DEDUP -->|memoria 10min ou UNIQUE no banco| FIM1[descarta duplicata]
+    DEDUP -->|novo| GUARD{loop-guard: entrada}
+    GUARD -->|rajada / cadencia / cap diario| PAUSA[pausa reversivel de 1h]
+    GUARD -->|ok| FILA[(fila persistente: status pendente)]
+    FILA --> BUFFER[buffer 6s - agrupa mensagens do contato]
+    BUFFER --> IA[LLM via OpenRouter + ferramentas]
+    IA --> TRAVA{INSERT com indice unico parcial}
+    TRAVA -->|conflito| RECUSA[recusa educada]
+    TRAVA -->|reservou| GCAL[cria evento no Google Calendar]
+    GCAL -->|falhou / indeterminado| RECON[reconciliacao: espera limitada + varredura por cron]
+    GCAL -->|ok| VINCULO[vinculo google_event_id gravado]
+    IA --> GUARD2{loop-guard: saida - resposta repetida?}
+    GUARD2 -->|3 identicas| PAUSA
+    GUARD2 -->|ok| SEND[envia resposta]
+    SEND --> OK[(status concluida)]
+    SEND -->|falha de entrega| ERRO[(status erro - reprocessa no boot)]
 ```
 
-Três decisões que moldaram o resto:
+Cinco decisões definem o sistema — cada uma com o porquê e o custo aceito:
 
-**Núcleo agnóstico de canal.** O WhatsApp é uma borda, não o centro. O que
-decide, agenda e cobra não sabe que existe WhatsApp — recebe texto e devolve
-texto, com ferramentas no meio. Outro canal entraria como outra borda.
+1. **O webhook responde 200 antes de processar.** Sem resposta rápida a Meta
+   reentrega, e reentrega alimenta loop e duplicata. Custo: tudo vira
+   assíncrono, e é preciso fila persistente e dedup em duas camadas (memória
+   + `UNIQUE` no banco, que sobrevive a restart).
+2. **A trava de agendamento é um índice único parcial no Postgres** — não
+   lock distribuído. A chave é o horário em si, e o `INSERT ... ON CONFLICT
+   DO NOTHING` é a reserva atômica. A primeira versão incluía o telefone na
+   chave, e dois clientes conseguiam cada um reservar "o seu" mesmo horário —
+   achado de revisão externa. Custo: reserva local e evento no Google são
+   dois passos, o que exige a reconciliação da seção 4.
+3. **O loop-guard é camada própria, antes do buffer.** Conta qualquer mensagem
+   que possa gerar resposta (loop bot-a-bot também acontece por sticker) e
+   roda depois do dedup, senão reentrega inflaria o contador.
+4. **A fila não deleta — troca status** (`pendente → processando → concluida |
+   erro`). Linha com erro continua elegível para reprocesso no próximo boot:
+   mensagem de cliente não se perde por causa de um deploy. Custo: restart
+   reprocessa o que ficou no meio — isso já reacendeu um loop pausado, e
+   virou regra de operação escrita.
+5. **Um processo, uma máquina.** Para dezenas de tenants de agendamento o
+   gargalo não é CPU — é acerto de concorrência. Custo declarado:
+   indisponibilidade breve no restart, mitigada pela fila.
 
-**Multi-tenant desde o primeiro dia.** Cada negócio tem seu número, sua agenda,
-seu catálogo, seu tom de voz e sua janela de retenção. O roteamento é pelo
-`phone_number_id` que a Meta manda no payload. Retrofitar multi-tenancy depois
-é reescrever tudo; nascer assim custou pouco.
+## 3. Como sei que funciona
 
-**O modelo chama ferramenta, não gera texto solto.** A assistente não "escreve"
-que agendou — ela chama `criar_agendamento`, e o agendamento acontece ou falha
-de forma verificável. Isso muda o tipo de erro possível: em vez de alucinar uma
-confirmação, ela recebe um erro e informa a pessoa.
+**A suíte prova o encanamento.** 25 arquivos / 368 testes (Vitest) contra
+**Postgres real** — só a IA e a API da Meta são simuladas. Arquivos em série
+(`fileParallelism: false`): os testes provam concorrência de verdade, então
+não podem competir entre si por engano.
 
----
+**Espera por sinal, não por tempo.** Como o webhook responde antes de
+processar, o teste espera condições observáveis (a linha existir, o status
+virar terminal). A única espera por tempo é a de asserção negativa ("nada foi
+enviado"), que não tem sinal por definição — e a janela dela foi medida, não
+chutada: 72 amostras, máximo 173 ms, folga = 2× o máximo ≈ 350 ms.
 
-## 3. Por que existe um loop-guard
+**O que a suíte NÃO prova é o comportamento do modelo.** Esse é o papel do
+[`sofia-eval`](https://github.com/andrenv14/sofia-eval), repositório irmão,
+público: monta payloads reais de webhook, assina como a Meta assinaria, ataca
+por HTTP com IA real e **julga pelo efeito no banco** — agendamento criado?
+duração certa? nada inventado? — não pelo texto da resposta. Cada cenário tem
+teto de chamadas e tokens calibrado por medição (3 passadas, teto = 2× o
+máximo). Um cenário do eval achou um bug real que a suíte não tinha como ver.
 
-A assistente entrou em loop de despedida com outro bot — um cobrador
-automatizado de outra empresa. Cada despedida educada era respondida com outra
-despedida educada, indefinidamente.
+![Relatório de uma rodada do eval](docs/relatorio-eval.png)
 
-![Loop bot-a-bot, com carimbos de hora](docs/loop-guard-incidente.png)
+**O prompt de produção tem snapshot byte a byte** — comparado com `toBe`
+contra um arquivo de referência, não com `toMatchSnapshot`: não pode ser
+regenerado em silêncio por um `vitest -u`.
 
-A captura mostra a tentativa de encerrar de forma explícita: *"Este número é uma
-assistente virtual e não recebe cobranças. Por favor, desconsidere este
-contato."* O outro bot responde agradecendo e **reinicia a apresentação do
-zero**. Não adianta ser claro quando não há ninguém lendo.
+**Correção de bug exige prova negativa.** Os testes novos rodam contra o
+código antigo e têm que FALHAR, pelo motivo esperado. Já derrubou parecer de
+revisão: uma busca por nome errava em dois sentidos, e o segundo só apareceu
+na prova negativa.
 
-**Rodou três dias.** Mais de 3.600 mensagens num único contato, com um segundo
-bot em situação parecida. Ninguém percebeu enquanto acontecia: não havia teto,
-nem alarme, nem log que distinguisse "conversa longa" de "loop". A descoberta
-foi manual — abrir o painel e ver milhares de mensagens de números
-desconhecidos.
+## 4. Mecanismos que valem leitura
 
-O custo absoluto foi de poucos dólares. **Esse é o ponto:** era barato demais
-para disparar suspeita e representava cerca de **60% de todo o gasto histórico
-de LLM** do sistema. Um problema que não dói hoje e escala linearmente com
-tenants e com tempo.
-
-### O buffer não resolvia, e entender por quê definiu a solução
-
-Já existia um agrupador de rajada: mensagens em sequência rápida viram um lote
-só, respondido de uma vez. Isso corta custo de uma pessoa mandando cinco
-mensagens seguidas — e **não tem nenhum efeito sobre um loop longo**. Uma
-mensagem a cada 20 segundos é um lote por mensagem, para sempre.
-
-São problemas diferentes: o buffer **agrupa para responder melhor**; o guard
-**corta para parar de responder**. Por isso o guard é uma camada separada, com
-estado próprio, e não uma extensão do agrupador — cuja lógica de debounce tem
-suíte delicada e dois achados de produção registrados nela.
-
-### Quatro camadas, dois pontos de entrada
-
-```js
-// Camada 1a — BURST: rajada curta.
-// Teto 35 (não 20) por causa de mídia: o WhatsApp entrega um envio único de
-// várias fotos como ~30 mensagens SEPARADAS em poucos segundos. Com teto 20, um
-// paciente mandando o rolo de fotos do dente era pausado por 1h em silêncio —
-// falso positivo caro numa clínica.
-const LOOP_MAX_MSGS = parseInt(process.env.LOOP_MAX_MSGS || '35', 10);
-const LOOP_JANELA_MS = parseInt(process.env.LOOP_JANELA_MS || '120000', 10);
-
-// Camada 1b — SUSTENTADO: segundo limiar sobre o MESMO array de timestamps.
-// Existe porque o burst sozinho não pegaria o incidente real: 1 msg a cada 20s
-// dá 6 por janela de 120s, contra um teto de 35 — nunca dispara. O mesmo ritmo
-// atinge 60/hora em ~20 minutos. Corta por CADÊNCIA, independente do conteúdo.
-const LOOP_MAX_MSGS_HORA = parseInt(process.env.LOOP_MAX_MSGS_HORA || '60', 10);
-
-// Camada 2 — cap diário por contato. A virada do dia usa o FUSO DO TENANT,
-// não UTC: em Teresina o contador zeraria às 21h.
-const LOOP_MAX_MSGS_DIA = parseInt(process.env.LOOP_MAX_MSGS_DIA || '150', 10);
-
-// Camada 3 — repetição da própria resposta (3 iguais seguidas).
-// Resposta com menos de 40 caracteres não entra no histórico nem dispara:
-// repetir "ok" é conversa humana normal, não loop.
-const LOOP_MIN_LEN_RESPOSTA = parseInt(process.env.LOOP_MIN_LEN_RESPOSTA || '40', 10);
-```
-
-O guard entra em **dois pontos**: um gate na chegada da mensagem e outro
-imediatamente antes do envio da resposta — o único lugar do código onde a
-resposta prestes a sair é observável.
-
-**A ordem em relação ao dedup é obrigatória.** Se o gate rodasse antes da
-checagem de mensagem duplicada, cada reentrega da Meta inflaria o contador, e um
-retry do lado deles poderia pausar um contato inocente.
-
-**A ação é pausa reversível, nunca bloqueio permanente.** Uma hora para rajada,
-cadência e repetição; até a virada do dia para o cap diário. Ao pausar, o
-histórico é zerado — senão o contato dispararia de novo na primeira mensagem
-depois da pausa, só por causa do histórico velho.
-
-### O que a validação em produção mostrou
-
-O guard cortou um episódio real **no mesmo dia em que entrou no ar** — e o
-contato era o mesmo do incidente original, reincidência e não caso novo:
-
-```
-[loop-guard] [tenant] contato ****7703 PAUSADO — motivo: cadencia
-(61 msgs em 1h (teto 60)) — pausado por ~60min
-```
-
-Três coisas que só apareceram com tráfego real:
-
-**Quem cortou foi a cadência, não a rajada.** No ritmo do loop — uma mensagem a
-cada 20 segundos — a camada de rajada via 6 mensagens por janela contra um teto
-de 35, e **nunca dispararia**. O segundo limiar foi acrescentado a pedido de uma
-revisão independente, e foi ele que pegou.
-
-**A camada de repetição também não podia disparar,** e isso está correto: as
-últimas respostas eram só emoji, abaixo do mínimo de 40 caracteres, então nem
-entravam no histórico de comparação. Se o guard dependesse só de detectar texto
-repetido, este episódio teria passado batido.
-
-**O custo cresce como curva, não como reta.** O episódio inteiro: 61 chamadas de
-LLM, 534.728 tokens — **530.575 de prompt contra 4.153 de resposta**, em 22
-minutos. O histórico da conversa é reenviado a cada chamada, então cada volta
-custa mais que a anterior. 61 mensagens não custam 61 unidades. É por isso que
-cortar cedo importa muito mais do que o contador de mensagens sugere.
-
-E um achado que virou regra geral: **o loop não recomeçou sozinho — foi o
-recovery de mensagens pendentes que o reacendeu num restart.** Duas mensagens
-velhas paradas na fila foram processadas como novas, a assistente respondeu, e o
-outro bot acordou. Todo restart reacende qualquer loop que estivesse dormindo na
-fila.
-
----
-
-## 4. Tratando input externo como hostil
-
-Tudo que vem de fora é hostil: payload de webhook, mensagem de usuário, campo de
-painel. O primeiro portão é a assinatura:
+### O webhook só aceita o que a Meta assinou
 
 ```js
 function assinaturaValida(req) {
@@ -197,8 +120,7 @@ function assinaturaValida(req) {
   if (!assinatura || !req.rawBody) return false;
 
   const esperado =
-    'sha256=' + crypto.createHmac('sha256', config.meta.appSecret)
-      .update(req.rawBody).digest('hex');
+    'sha256=' + crypto.createHmac('sha256', config.meta.appSecret).update(req.rawBody).digest('hex');
 
   try {
     return crypto.timingSafeEqual(Buffer.from(assinatura), Buffer.from(esperado));
@@ -206,111 +128,152 @@ function assinaturaValida(req) {
     return false;
   }
 }
-
-app.post('/webhook', (req, res) => {
-  if (!assinaturaValida(req)) {
-    console.warn('[webhook] assinatura inválida, ignorando payload');
-    return res.sendStatus(401);
-  }
-
-  res.sendStatus(200);
-  processarWebhook(req.body).catch((err) =>
-    console.error('[webhook] erro ao processar:', err));
-});
 ```
 
-Três detalhes que importam mais do que parecem:
+Dois detalhes fáceis de errar: o HMAC é sobre os **bytes crus** (capturados no
+`verify` do `express.json` — assinar o objeto re-serializado não bate), e o
+`timingSafeEqual` fica dentro de `try`, porque buffers de tamanhos diferentes
+lançam — e isso não pode virar 500.
 
-**A comparação é `timingSafeEqual`, não `===`.** Comparação comum de string sai
-no primeiro byte diferente, e o tempo de resposta vaza informação sobre a
-assinatura esperada.
+### Loop-guard: janela deslizante com pausa reversível
 
-**A verificação usa o corpo cru,** não o JSON já parseado. Serializar de volta
-produziria bytes diferentes dos que a Meta assinou.
+Existe porque aconteceu: dois bots conversando entre si, milhares de mensagens
+até alguém notar. Em produção desde 23/08/2026 — e no mesmo dia cortou um
+reacendimento real em 22 minutos: 61 chamadas de LLM, 534.728 tokens. (Medido
+depois: 58,7% do gasto daquele dia, e o dia inteiro foi 1,65% do gasto do mês —
+o número assusta menos do que parece, e é publicado assim mesmo.)
 
-**O `200` sai antes do processamento.** A Meta espera confirmação rápida e
-reentrega o que demora — processar antes de responder transformaria lentidão em
-mensagem duplicada.
+```js
+const LOOP_MAX_MSGS = 35;        // rajada: 35 msgs em 120s
+const LOOP_MAX_MSGS_HORA = 60;   // cadência: 60 msgs em 1h
+const LOOP_MAX_MSGS_DIA = 150;   // cap diário, virado no fuso do tenant
+const LOOP_PAUSA_MS = 3600000;   // pausa de 1h, reversível sozinha
 
----
+export function registrarEntrada(chave, { timezone, agora = Date.now() } = {}) {
+  const e = estadoDe(chave);
 
-## 5. LGPD como requisito de projeto
+  if (e.pausadoAte && agora < e.pausadoAte) {
+    return { permitido: false, motivo: e.motivo, pausadoAte: e.pausadoAte };
+  }
+  if (e.pausadoAte && agora >= e.pausadoAte) {
+    e.pausadoAte = null;   // pausa venceu — volta a atender normalmente
+    e.motivo = null;
+  }
 
-O primeiro cliente pagante é uma clínica odontológica. Conversa de paciente com clínica é dado de
-saúde, com regime mais rígido que dado comum — e isso mudou decisões de
-arquitetura, não só de política.
+  e.eventos.push(agora);
+  e.eventos = e.eventos.filter((t) => agora - t < RETENCAO_EVENTOS_MS);
 
-**O módulo do guard nunca recebe telefone em claro.** A função que mascara fica
-fora dele, e quem chama passa o valor já mascarado. Assim não há como vazar
-número mesmo que alguém acrescente um `console.log` lá dentro depois. A chave
-interna contém o telefone porque precisa identificar o contato, mas nunca é
-impressa. Conteúdo de mensagem nunca vai para o log.
+  if (contadorDiario(e, timezone, agora) > LOOP_MAX_MSGS_DIA) {
+    return pausar(e, 'cap_diario', agora, viradaDoDia(timezone, agora));
+  }
+  if (e.eventos.filter((t) => agora - t < LOOP_JANELA_MS).length > LOOP_MAX_MSGS) {
+    return pausar(e, 'rajada', agora, agora + LOOP_PAUSA_MS);
+  }
+  if (e.eventos.length > LOOP_MAX_MSGS_HORA) {
+    return pausar(e, 'cadencia', agora, agora + LOOP_PAUSA_MS);
+  }
+  return { permitido: true };
+}
+```
 
-**Retenção automática por tenant.** Histórico de conversa é apagado por padrão
-90 dias após a última mensagem. E, mais importante: está documentado
-exatamente **o que a retenção cobre e o que não cobre** — saber que ela apaga
-uma tabela e não as outras é o que impede prometer ao cliente algo que o sistema
-não faz.
+O corte real, como saiu no log (o telefone nasce mascarado pelo código de log):
 
-**O papel é duplo, e a política diz isso.** Para dados do negócio contratante, a
-empresa é controladora. Para dados de clientes finais que mandam mensagem, é
-operadora, agindo por instrução do negócio — que é o controlador. Confundir os
-dois papéis é o erro mais comum nesse tipo de produto.
+```
+[loop-guard] contato ****7703 PAUSADO — motivo: cadencia
+(61 msgs em 1h (teto 60)) — pausado por ~60min
+```
 
-**Roteamento de IA restrito a provedores com retenção zero,** para que conteúdo
-de conversa não fique armazenado fora do servidor.
+### Runner de migrations: perguntar ao banco, não interpretar SQL
 
----
+Migration aplicada à mão em duas máquinas causou dois erros de "o arquivo
+viajou no pull, o efeito não". O runner aplica o que falta, uma transação por
+arquivo — e como alguns arquivos têm `BEGIN;`/`COMMIT;` próprios, ele **não
+interpreta o SQL** para descobrir o que aconteceu: pergunta ao Postgres, com
+`txid_status`, o veredito da transação que abriu.
 
-## 6. Lidando com plataforma de terceiro
+```js
+await client.query('BEGIN');
+const t0 = await txidAtual(client);            // SELECT txid_current()
+try {
+  await client.query(sql);                     // texto original, sem transformação
+} catch (err) {
+  await client.query('ROLLBACK').catch(() => {});
+  const status = await statusTxid(client, t0); // SELECT txid_status($1)
+  throw new ErroMigration(nome, err, status === 'committed');
+}
+const status = await statusTxid(client, t0);
+if (status !== 'in progress' && status !== 'committed') {
+  // 'aborted': o PRÓPRIO arquivo deu ROLLBACK sem lançar erro.
+  // A direção segura é recusar, não assumir sucesso.
+  throw new ErroMigration(nome, new Error(`terminou em "${status}"`));
+}
+```
 
-Nem toda restrição está na documentação, e algumas só aparecem quando você já
-construiu em cima da suposição errada.
+Na adoção contra a base real: 24 migrations reconhecidas, 0 aplicadas por
+engano, 0 falhas. O limite é declarado no próprio runner: SQL executado depois
+do fim de `t0` é indeterminado — nesse caso ele para e pede inspeção humana.
 
-O onboarding usa o fluxo oficial de cadastro incorporado da Meta. A
-implementação estava pronta e testada — e o diálogo recusava com o erro
-`#2655111`: exige **acesso avançado** às permissões de mensagens e
-gerenciamento, que só é concedido por análise do aplicativo.
+### Reconciliação: um sinal, três estados
 
-A leitura natural da documentação é que a análise vem *depois* de você testar o
-fluxo. Não vem: **a análise é pré-requisito do teste**, não passo posterior. Não
-há como demonstrar funcionando algo que só funciona depois de aprovado.
+Reserva local e evento no Google são dois passos. Entre eles, um único sinal —
+linha ativa sem `google_event_id` — cobre três estados que pedem reações
+diferentes:
 
-O que isso exigiu na prática: montar a submissão explicando por escrito que a
-gravação de tela para no erro, e por quê. E entender que uma dependência externa
-pode inverter a ordem de um plano inteiro — o cronograma passou a ter um bloco
-que não depende de esforço, só de espera.
+| Estado | O banco diz | O Google tem | Dura |
+|---|---|---|---|
+| em voo | reserva | nada ainda | ~1,2 s (mediana medida) |
+| órfã | reserva | nada, nunca | para sempre |
+| vínculo perdido | reserva | o evento existe | para sempre |
 
----
+Os números vêm de medição em produção — mediana 1.174 ms, p95 1.270 ms, máximo
+1.378 ms — e deles derivam as constantes: espera limitada de 1.500 ms (acima
+do p95) relendo o banco a cada 250 ms **antes** de consultar o Google (o
+inverso pagaria ~1,2 s em toda corrida que a releitura resolve de graça), e
+varredura por cron com limiar de 15 min (~650× o máximo observado — margem,
+não limite). Quando nada disso resolve, o sistema não afirma o que não sabe:
 
-## 7. Operação
+```js
+return {
+  sucesso: false,
+  erro: 'Ainda não consegui confirmar esse horário, tenta de novo em instantes.',
+  precisa_verificar_novamente: true,
+};
+```
 
-O sistema roda numa VPS: Node sob PM2, Nginx como proxy reverso, Let's Encrypt
-para TLS, PostgreSQL na mesma máquina. Não é infraestrutura sofisticada — é
-infraestrutura que precisa ficar de pé.
+A invariante: **criar agendamento nunca devolve sucesso sem o vínculo do
+evento**. E a varredura roda por cron, não por `setInterval` — `setInterval`
+morre com o processo, e morte de processo é justamente o que gera órfã.
 
-O que a operação ensinou, e que não aparece escrevendo código:
+## 5. Dados e operação como propriedades
 
-**Erro silencioso é pior que crash.** Uma mensagem que falha ao ser entregue não
-pode terminar marcada como concluída. Há teste específico para isso: falha da
-API externa deixa a mensagem em `erro`, nunca em `concluida`.
+- **Retenção é por tenant e o banco a executa.** `retention_days` (padrão 90)
+  é coluna editável no painel; um job diário apaga conversas mais velhas que o
+  prazo — inclusive de tenants inativos. O limite é documentado com a mesma
+  franqueza: a retenção cobre as mensagens, não (ainda) as tabelas
+  operacionais — escrito onde quem promete prazo a cliente lê antes de
+  prometer.
+- **Log nunca carrega conteúdo nem telefone.** Toda linha que toca um contato
+  passa por máscara (4 últimos dígitos); o texto da mensagem não vai para log
+  em hipótese nenhuma. O módulo do loop-guard nem recebe telefone em claro.
+- **Dado pessoal fora do fluxo nasce com data de morte.** Quando um módulo foi
+  removido do produto, o dump de segurança das tabelas dele já nasceu com a
+  data de expurgo registrada por escrito, nas duas máquinas que o guardavam.
+- **Operação com carimbo:** logs de cron com timestamp ISO por linha, rotação
+  de logs do processo, e a varredura de órfãs loga tenant, horário e veredito
+  de cada linha em que agiu — nunca o telefone.
 
-**Campo preenchido não é conexão funcionando.** Um painel que mostra "ok" para
-qualquer string não-vazia deixou passar um token que era literalmente a palavra
-`PENDENTE`. O erro só apareceu em runtime. Verificação de verdade consulta a API
-e confirma; não confia no que está gravado.
+## 6. Como o projeto é construído
 
-**Um diretório servido por `try_files` entrega qualquer arquivo que exista,
-incluindo dotfiles.** Versionar o site diretamente na pasta servida exporia o
-`.git` na internet aberta. O repositório ficou fora da pasta servida até haver
-uma regra de negação no Nginx.
+Uma pessoa e um conjunto de agentes de IA com papéis fixos: cada fatia nasce
+com plano aprovado e versionado no repositório, é implementada numa sessão
+própria e passa por filtros — revisor, conferidor de citações, prova negativa
+— antes do revisor independente, que é **outro modelo, de outro fornecedor**,
+e é quem declara "apto a deploy" ou devolve o bloqueador. Quem implementa
+nunca se auto-revisa; a terceira correção seguida na mesma classe de problema
+não vira quarta, vira redesenho; e o deploy segue roteiro escrito, com suíte
+verde antes e log limpo verificado depois.
 
-**Backup na mesma máquina não é backup.** Cópia fora da VPS e monitoramento de
-disponibilidade são requisitos, não melhorias.
-
----
-
-## 8. O que ficou de fora, e por quê
+## 7. O que ficou de fora, e por quê
 
 Cortar escopo é decisão de projeto, não falta dele.
 
@@ -319,9 +282,9 @@ disponível, e a demanda real não estava: nenhum cliente pediu, e o mesmo
 resultado era obtido configurando o comportamento por tenant. Feature sem
 comprador não entra na fila.
 
-**Disparo em massa.** O sistema envia lembrete de utilidade — mensagem sobre um
-agendamento que a pessoa marcou. Campanha para lista é outro produto, com outro
-regime de consentimento e outra relação com a plataforma. Recusar isso é
+**Disparo em massa.** O sistema envia lembrete de utilidade — mensagem sobre
+um agendamento que a pessoa marcou. Campanha para lista é outro produto, com
+outro regime de consentimento e outra relação com a plataforma. Recusar isso é
 posicionamento, e a assistente comercial é instruída a recusar quando pedem.
 
 **Aplicativo móvel próprio.** O cliente já tem o WhatsApp instalado. Um app a
@@ -331,6 +294,9 @@ mais é fricção a mais para resolver um problema que não existe.
 
 ## Sobre este repositório
 
-Repositório de leitura, não de execução. O código de produção é privado; os
-trechos aqui foram escolhidos por mostrarem decisão, e estão com nomes
-genéricos, sem qualquer dado de cliente.
+Repositório de leitura, não de execução. Os trechos foram escolhidos por
+mostrarem decisão, estão levemente condensados (helpers triviais omitidos) e
+não carregam dado de cliente. O repositório irmão
+[`sofia-eval`](https://github.com/andrenv14/sofia-eval) — a parte pública
+executável — mostra como o comportamento do modelo é avaliado de fora, pelo
+efeito no banco.
