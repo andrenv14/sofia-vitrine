@@ -9,7 +9,7 @@ sistema.
 O código de produção é privado. Este repositório mostra a arquitetura e os
 trechos que valem leitura. Escolhi os que mostram uma decisão, não os maiores.
 
-**No ar:** [riachotech.com.br](https://riachotech.com.br) ·
+**No ar:** [riachotech.com.br](https://riachotech.com.br) ([o código do site](https://github.com/andrenv14/riachotech-site)) ·
 [@riacho_tech](https://www.instagram.com/riacho_tech/) ·
 [`sofia-eval`](https://github.com/andrenv14/sofia-eval), o avaliador de
 comportamento, é público e roda.
@@ -371,7 +371,7 @@ nenhuma credencial de produção**: token da plataforma falso, banco de teste,
 chave do modelo com teto próprio. Nada que vaze de um lado alcança o outro.
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph DEV["Desenvolvimento (sem credencial de produção)"]
         FATIA["sessão de trabalho:<br/>uma tarefa, plano aprovado antes"]
         SUITE["suíte de testes"]
