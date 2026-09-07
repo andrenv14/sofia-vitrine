@@ -31,27 +31,71 @@ exige em troca — concorrência e falha resolvidas com o banco e com o desenho 
 O caminho de uma mensagem, com os ramos de falha no lugar em que são tratados:
 
 ```mermaid
-flowchart TD
-    META[WhatsApp Cloud API] -->|POST /webhook| HMAC{assinatura HMAC valida?}
-    HMAC -->|nao| R401[401 - ignorado]
-    HMAC -->|sim| ACK[responde 200 imediatamente]
-    ACK --> DEDUP{wamid ja visto?}
-    DEDUP -->|memoria 10min ou UNIQUE no banco| FIM1[descarta duplicata]
-    DEDUP -->|novo| GUARD{loop-guard: entrada}
-    GUARD -->|rajada / cadencia / cap diario| PAUSA[pausa reversivel de 1h]
-    GUARD -->|ok| FILA[(fila persistente: status pendente)]
-    FILA --> BUFFER[buffer 6s - agrupa mensagens do contato]
-    BUFFER --> IA[LLM via OpenRouter + ferramentas]
-    IA --> TRAVA{INSERT com indice unico parcial}
-    TRAVA -->|conflito| RECUSA[recusa educada]
-    TRAVA -->|reservou| GCAL[cria evento no Google Calendar]
-    GCAL -->|falhou / indeterminado| RECON[reconciliacao: espera limitada + varredura por cron]
-    GCAL -->|ok| VINCULO[vinculo google_event_id gravado]
-    IA --> GUARD2{loop-guard: saida - resposta repetida?}
-    GUARD2 -->|3 identicas| PAUSA
-    GUARD2 -->|ok| SEND[envia resposta]
-    SEND --> OK[(status concluida)]
-    SEND -->|falha de entrega| ERRO[(status erro - reprocessa no boot)]
+flowchart TB
+    META([WhatsApp Cloud API])
+    HMAC{assinatura da Meta}
+    X401[401, ignora]
+    ACK[responde 200 antes de processar]
+    CAMPO{campo do payload}
+
+    subgraph CLIENTE[Caminho do cliente]
+        C1{wamid ja visto?}
+        C2[descarta duplicata]
+        C3{loop-guard de entrada}
+        C4[pausa reversivel de 1h]
+        C5[(fila persistente)]
+        C6{contato silenciado?}
+        C7[grava sem responder]
+        C8[buffer de 6s agrupa o contato]
+        C9[LLM com ferramentas]
+        C10{reserva do horario}
+        C11[recusa educada]
+        C12[cria o evento no Google Calendar]
+        C13[reconciliacao: espera limitada e varredura]
+        C14{loop-guard de saida}
+        C15[envia pela Cloud API]
+    end
+
+    subgraph EQUIPE[Caminho da equipe - Coexistence]
+        E1{echo do nosso proprio envio?}
+        E2[ignora, para nao se silenciar sozinha]
+        E3[silencia o contato por 15 min]
+        E4[grava a fala da equipe com a marca de autoria]
+    end
+
+    H[(historico da conversa)]
+
+    META --> HMAC
+    HMAC -->|invalida| X401
+    HMAC -->|valida| ACK
+    ACK --> CAMPO
+    CAMPO -->|messages| C1
+    CAMPO -->|smb_message_echoes| E1
+
+    C1 -->|sim| C2
+    C1 -->|nao| C3
+    C3 -->|rajada, cadencia ou cap diario| C4
+    C3 -->|ok| C5
+    C5 --> C6
+    C6 -->|sim| C7
+    C6 -->|nao| C8
+    C8 --> C9
+    C9 --> C10
+    C10 -->|conflito no indice unico parcial| C11
+    C10 -->|reservou| C12
+    C12 -->|falha ou resultado indeterminado| C13
+    C9 --> C14
+    C14 -->|4 respostas identicas| C4
+    C14 -->|ok| C15
+
+    E1 -->|sim| E2
+    E1 -->|nao| E3
+    E3 --> E4
+
+    C7 --> H
+    C15 --> H
+    E4 --> H
+    H -.->|o que o modelo le no turno seguinte| C9
 ```
 
 Cinco decisões definem o sistema — cada uma com o porquê e o custo aceito:
@@ -80,8 +124,10 @@ Cinco decisões definem o sistema — cada uma com o porquê e o custo aceito:
 
 ## 3. Como sei que funciona
 
-**A suíte prova o encanamento.** 25 arquivos / 368 testes (Vitest) contra
-**Postgres real** — só a IA e a API da Meta são simuladas. Arquivos em série
+**A suíte prova o encanamento.** 47 arquivos / 694 testes (Vitest) contra
+**Postgres real** — só a IA e a API da Meta são simuladas. (O número se rederiva
+com `npm test`; ele muda a cada fatia, e por isso não vive em comentário de
+código neste projeto.) Arquivos em série
 (`fileParallelism: false`): os testes provam concorrência de verdade, então
 não podem competir entre si por engano.
 
@@ -95,9 +141,12 @@ chutada: 72 amostras, máximo 173 ms, folga = 2× o máximo ≈ 350 ms.
 [`sofia-eval`](https://github.com/andrenv14/sofia-eval), repositório irmão,
 público: monta payloads reais de webhook, assina como a Meta assinaria, ataca
 por HTTP com IA real e **julga pelo efeito no banco** — agendamento criado?
-duração certa? nada inventado? — não pelo texto da resposta. Cada cenário tem
-teto de chamadas e tokens calibrado por medição (3 passadas, teto = 2× o
-máximo). Um cenário do eval achou um bug real que a suíte não tinha como ver.
+duração certa? nada inventado? — não pelo texto da resposta. São 16 cenários, e
+**cada um tem teto de chamadas e de tokens calibrado por medição** — 3 passadas,
+teto igual a 2× o máximo observado, todos contra o mesmo modelo e o mesmo commit.
+O teto não é conforto: é o que faz uma regressão de custo aparecer como falha em
+vez de virar conta no fim do mês. Um cenário do eval achou um bug real que a
+suíte não tinha como ver.
 
 ![Relatório de uma rodada do eval](docs/relatorio-eval.png)
 
@@ -244,6 +293,60 @@ A invariante: **criar agendamento nunca devolve sucesso sem o vínculo do
 evento**. E a varredura roda por cron, não por `setInterval` — `setInterval`
 morre com o processo, e morte de processo é justamente o que gera órfã.
 
+### Coexistence: duas vozes no mesmo número, e como o sistema sabe de quem é cada linha
+
+O cliente não troca de número nem para de usar o WhatsApp no celular. A dona da
+clínica continua respondendo pelo aplicativo dela, e a assistente responde no
+mesmo número — é o modo **Coexistence** da plataforma oficial. O que isso cria é
+um problema que não existe num bot comum: **duas pessoas escrevem do mesmo
+lado da conversa.**
+
+A plataforma entrega a fala da dona num campo diferente do da mensagem do
+cliente (`smb_message_echoes` em vez de `messages`). Três coisas acontecem
+quando ela chega:
+
+1. **O sistema reconhece o próprio eco.** Toda mensagem que a assistente envia
+   volta como echo. Sem essa checagem ela se silenciaria sozinha a cada resposta.
+2. **A assistente se cala por 15 minutos naquele contato.** Quem assumiu a
+   conversa é uma pessoa; falar por cima é pior que ficar quieto.
+3. **A fala da dona entra no histórico com uma marca de autoria.**
+
+A marca é o detalhe que faz o resto funcionar. Para o modelo, a dona e a
+assistente são o mesmo lado da conversa — gravar a fala da dona como se fosse do
+cliente ensinaria a assistente que o cliente disse o que a dona disse. Mas
+*dentro* desse lado, sem marca, ela não distingue uma promessa própria de uma
+frase da dona:
+
+```js
+export const MARCA_ATENDIMENTO = '[mensagem enviada pelo atendimento]';
+
+export function comMarcaDeAtendimento(texto) {
+  return `${MARCA_ATENDIMENTO} ${texto}`;
+}
+```
+
+Duas linhas, e a disciplina está no que elas **não** afirmam: a marca diz quem
+escreveu aquela linha, e nada além disso. Não afirma que o horário citado ali
+existe, não afirma que não existe, não enumera tipo de mensagem. O módulo é
+folha — não importa nada — porque quem monta o prompt de sistema o consome, e a
+constante e a instrução não podem divergir: a instrução **interpola** a
+constante em vez de repetir o texto.
+
+A instrução, presente só para tenant em Coexistence, fecha o caso que motivou
+tudo: se numa linha marcada a pessoa ofereceu um horário e o cliente aceita
+("pode ser", "confirmado então"), a assistente **não confirma** — ela chama a
+ferramenta de atendente humano e avisa que a equipe assume. Ela não agenda o que
+não foi ela quem ofereceu e verificou.
+
+**Como sei que funciona.** O cenário `17-marca-de-autoria-do-dono` do
+[`sofia-eval`](https://github.com/andrenv14/sofia-eval) foi escrito para nascer
+VERMELHO: a dona oferece um horário, o cliente diz "confirmado então", e a
+assistente confirmava um horário que nunca ofereceu nem verificou — três
+passadas, mesmo resultado. Depois da marca: verde em três passadas, com a
+pendência de atendimento humano registrada no banco. E o mesmo cenário rodado
+contra o código anterior continua vermelho — o controle que separa "a correção
+funcionou" de "o modelo teve um dia bom".
+
 ## 5. Dados e operação como propriedades
 
 - **Retenção é por tenant e o banco a executa.** `retention_days` (padrão 90)
@@ -262,16 +365,54 @@ morre com o processo, e morte de processo é justamente o que gera órfã.
   de logs do processo, e a varredura de órfãs loga tenant, horário e veredito
   de cada linha em que agiu — nunca o telefone.
 
-## 6. Como o projeto é construído
+## 6. Como o projeto é construído: uma pessoa e agentes com papéis fixos
 
-Uma pessoa e um conjunto de agentes de IA com papéis fixos: cada fatia nasce
-com plano aprovado e versionado no repositório, é implementada numa sessão
-própria e passa por filtros — revisor, conferidor de citações, prova negativa
-— antes do revisor independente, que é **outro modelo, de outro fornecedor**,
-e é quem declara "apto a deploy" ou devolve o bloqueador. Quem implementa
-nunca se auto-revisa; a terceira correção seguida na mesma classe de problema
-não vira quarta, vira redesenho; e o deploy segue roteiro escrito, com suíte
-verde antes e log limpo verificado depois.
+O sistema é escrito por uma pessoa dirigindo agentes de IA, e a parte que vale
+ler não é "usei IA para programar" — é o **arranjo que torna o resultado
+verificável**.
+
+**Duas máquinas, e a separação é de segurança.** A VPS é produção: atende
+cliente pagante, e por isso não roda a suíte em horário de movimento. O ambiente
+de desenvolvimento roda a suíte e o avaliador de comportamento, e **não tem
+nenhuma credencial de produção** — token da plataforma falso, banco de teste,
+chave de LLM com teto próprio. Nada que vaze de um lado alcança o outro.
+
+**Papéis fixos, e nenhum acumula dois.**
+
+| Papel | O que faz | O que nunca faz |
+|---|---|---|
+| Sessão-guia | orquestra, mede, dispara os filtros, faz merge e deploy | implementar fatia |
+| Sessão de fatia | uma por vez, working tree próprio, plano aprovado antes da primeira linha | revisar o próprio diff |
+| Sessão do avaliador | roda o `sofia-eval` com IA real | tocar o código de produção |
+| Subagentes | revisor de diff, conferidor de citações, prova negativa, auditores de infra e de documentação | decidir merge |
+| Revisor independente | **outro modelo, de outro fornecedor**: lê a branch inteira e declara "apto a deploy" ou devolve o bloqueador | implementar qualquer coisa |
+
+**As regras que fazem o arranjo valer alguma coisa.** Cada uma existe porque a
+ausência dela deixou passar algo:
+
+- **Quem implementa não se auto-revisa, e concordar não é corroborar.** Dois
+  agentes que leram o mesmo código com o mesmo ponto cego não são duas fontes.
+  Duas fontes só contam quando podiam discordar.
+- **Medição que sustenta um merge carrega o commit e o estado da árvore no
+  cabeçalho.** Um número sem isso não se liga ao código que vai ao ar — e quando
+  uma medição precisa ser reaproveitada entre dois commits, o que autoriza é o
+  hash da árvore de `src/`, não a leitura da mensagem do commit.
+- **Texto durável cita arquivo e nome de função, nunca número de linha.** Nome
+  sobrevive a deslocamento; linha envelhece em silêncio. Contagem em comentário
+  vem com o comando que a rederiva, ou não entra.
+- **Verificação que passa observando nada precisa primeiro ser vista falhar.**
+  "Nenhum agendamento criado" é satisfeito tanto pelo acerto quanto pelo sistema
+  não ter rodado. Antes de aceitar uma asserção dessas, quebra-se o código de
+  propósito para vê-la ficar vermelha.
+- **A terceira correção seguida na mesma classe não vira quarta: vira
+  redesenho.** Remendo que precisa de remendo é sintoma de desenho errado.
+- **Os filtros rodam em sequência, nunca em paralelo** — disputam working tree,
+  banco de teste e porta.
+
+**O deploy segue roteiro escrito**: suíte verde antes, commit antes da migration,
+reinício só depois, e o log do processo no ar conferido depois — não a suíte de
+novo, que testaria outra vez o mesmo código em vez do processo que está
+atendendo.
 
 ## 7. O que ficou de fora, e por quê
 
