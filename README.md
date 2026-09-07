@@ -435,7 +435,4 @@ mais é fricção a mais para resolver um problema que não existe.
 
 Repositório de leitura, não de execução. Os trechos foram escolhidos por
 mostrarem decisão, estão levemente condensados (helpers triviais omitidos) e
-não carregam dado de cliente. O repositório irmão
-[`sofia-eval`](https://github.com/andrenv14/sofia-eval) — a parte pública
-executável — mostra como o comportamento do modelo é avaliado de fora, pelo
-efeito no banco.
+não carregam dado de cliente.
