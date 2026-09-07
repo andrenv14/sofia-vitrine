@@ -10,9 +10,7 @@ trechos que valem leitura — escolhidos por mostrarem decisão, não por serem 
 maiores.
 
 **No ar:** [riachotech.com.br](https://riachotech.com.br) ·
-[@riacho_tech](https://www.instagram.com/riacho_tech/) ·
-[`sofia-eval`](https://github.com/andrenv14/sofia-eval), o avaliador de
-comportamento, é público e executável.
+[@riacho_tech](https://www.instagram.com/riacho_tech/) 
 
 ---
 
