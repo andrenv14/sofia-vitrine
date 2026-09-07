@@ -12,7 +12,8 @@ trechos que valem leitura. Escolhi os que mostram uma decisão, não os maiores.
 **No ar:** [riachotech.com.br](https://riachotech.com.br) ([o código do site](https://github.com/andrenv14/riachotech-site)) ·
 [@riacho_tech](https://www.instagram.com/riacho_tech/) ·
 [`sofia-eval`](https://github.com/andrenv14/sofia-eval), o avaliador de
-comportamento, é público e roda.
+comportamento, é público e roda ·
+[`sofia-agents`](https://github.com/andrenv14/sofia-agents), o processo que produziu tudo isto.
 
 ---
 
@@ -426,6 +427,10 @@ cada uma existe porque a falta dela deixou passar algo.
 migration, reinício depois, e então o log do processo no ar. Não a suíte de
 novo, que testaria o mesmo código em vez do processo que está atendendo.
 
+Esta seção é o resumo. O arranjo inteiro está em [`sofia-agents`](https://github.com/andrenv14/sofia-agents):
+as regras completas, a definição de cada agente, os hooks que entregam estado e
+pedem permissão, e como o contexto é organizado entre os arquivos.
+
 ## 7. Escopo
 
 O sistema faz agendamento por conversa, e para nisso. Lembrete é mensagem sobre
@@ -443,7 +448,8 @@ que não existe. Feature sem comprador não entra na fila.
 
 Repositório de leitura, não de execução. Os trechos foram escolhidos por
 mostrarem decisão, estão levemente condensados (funções triviais omitidas) e
-não carregam dado de cliente. O irmão
+não carregam dado de cliente. Os irmãos:
 [`sofia-eval`](https://github.com/andrenv14/sofia-eval) é a parte pública que
-roda: mostra como o comportamento do modelo é avaliado de fora, pelo efeito no
-banco.
+roda, e mostra como o comportamento do modelo é avaliado de fora, pelo efeito no
+banco; [`sofia-agents`](https://github.com/andrenv14/sofia-agents) é o método de trabalho por trás
+da seção 6.
