@@ -9,6 +9,11 @@ O código de produção é privado. Este repositório mostra a arquitetura e os
 trechos que valem leitura — escolhidos por mostrarem decisão, não por serem os
 maiores.
 
+**No ar:** [riachotech.com.br](https://riachotech.com.br) ·
+[@riacho_tech](https://www.instagram.com/riacho_tech/) ·
+[`sofia-eval`](https://github.com/andrenv14/sofia-eval), o avaliador de
+comportamento, é público e executável.
+
 ---
 
 ## 1. O que é, e a prova de que está no ar
@@ -28,74 +33,44 @@ exige em troca — concorrência e falha resolvidas com o banco e com o desenho 
 
 ## 2. Arquitetura
 
-O caminho de uma mensagem, com os ramos de falha no lugar em que são tratados:
+### A infraestrutura, inteira
+
+Uma máquina, um processo, três serviços externos. Sem fila externa, sem
+contêiner, sem framework de bot.
+
+```mermaid
+flowchart LR
+    CLIENTE([Cliente no WhatsApp]) --> META[WhatsApp Cloud API]
+    META -->|webhook assinado| NGINX[Nginx e TLS]
+    subgraph VPS[VPS: um processo, uma maquina]
+        NGINX --> APP[Node e Express sob PM2]
+        APP --> PG[(PostgreSQL)]
+    end
+    APP -->|agenda real| GCAL[Google Calendar]
+    APP -->|modelo por tenant| LLM[OpenRouter]
+    APP -->|cobranca| PIX[Mercado Pago]
+```
+
+### O caminho de uma mensagem
+
+Cada ramo de falha aparece onde é tratado — é o que a stack pequena exige em
+troca.
 
 ```mermaid
 flowchart TB
-    META([WhatsApp Cloud API])
-    HMAC{assinatura da Meta}
-    X401[401, ignora]
-    ACK[responde 200 antes de processar]
-    CAMPO{campo do payload}
-
-    subgraph CLIENTE[Caminho do cliente]
-        C1{wamid ja visto?}
-        C2[descarta duplicata]
-        C3{loop-guard de entrada}
-        C4[pausa reversivel de 1h]
-        C5[(fila persistente)]
-        C6{contato silenciado?}
-        C7[grava sem responder]
-        C8[buffer de 6s agrupa o contato]
-        C9[LLM com ferramentas]
-        C10{reserva do horario}
-        C11[recusa educada]
-        C12[cria o evento no Google Calendar]
-        C13[reconciliacao: espera limitada e varredura]
-        C14{loop-guard de saida}
-        C15[envia pela Cloud API]
-    end
-
-    subgraph EQUIPE[Caminho da equipe - Coexistence]
-        E1{echo do nosso proprio envio?}
-        E2[ignora, para nao se silenciar sozinha]
-        E3[silencia o contato por 15 min]
-        E4[grava a fala da equipe com a marca de autoria]
-    end
-
-    H[(historico da conversa)]
-
-    META --> HMAC
-    HMAC -->|invalida| X401
-    HMAC -->|valida| ACK
-    ACK --> CAMPO
-    CAMPO -->|messages| C1
-    CAMPO -->|smb_message_echoes| E1
-
-    C1 -->|sim| C2
-    C1 -->|nao| C3
-    C3 -->|rajada, cadencia ou cap diario| C4
-    C3 -->|ok| C5
-    C5 --> C6
-    C6 -->|sim| C7
-    C6 -->|nao| C8
-    C8 --> C9
-    C9 --> C10
-    C10 -->|conflito no indice unico parcial| C11
-    C10 -->|reservou| C12
-    C12 -->|falha ou resultado indeterminado| C13
-    C9 --> C14
-    C14 -->|4 respostas identicas| C4
-    C14 -->|ok| C15
-
-    E1 -->|sim| E2
-    E1 -->|nao| E3
-    E3 --> E4
-
-    C7 --> H
-    C15 --> H
-    E4 --> H
-    H -.->|o que o modelo le no turno seguinte| C9
+    IN([mensagem do cliente]) --> ACK[responde 200 antes de processar]
+    ACK --> DEDUP{wamid ja visto?}
+    DEDUP -->|sim| FIM[descarta duplicata]
+    DEDUP -->|nao| GUARD{loop-guard de entrada}
+    GUARD -->|rajada ou cap diario| PAUSA[pausa reversivel de 1h]
+    GUARD -->|ok| FILA[(fila persistente)]
+    FILA --> BUF[buffer de 6s agrupa o contato]
+    BUF --> LLM[LLM com ferramentas]
+    LLM --> RES{reserva do horario}
+    RES -->|conflito no indice unico| NAO[recusa educada]
+    RES -->|reservou| CAL[cria evento no Calendar]
+    CAL -.->|falha ou indeterminado| REC[reconciliacao]
+    LLM --> OUT[resposta enviada]
 ```
 
 Cinco decisões definem o sistema — cada uma com o porquê e o custo aceito:
@@ -295,11 +270,21 @@ morre com o processo, e morte de processo é justamente o que gera órfã.
 
 ### Coexistence: duas vozes no mesmo número, e como o sistema sabe de quem é cada linha
 
-O cliente não troca de número nem para de usar o WhatsApp no celular. A dona da
-clínica continua respondendo pelo aplicativo dela, e a assistente responde no
-mesmo número — é o modo **Coexistence** da plataforma oficial. O que isso cria é
-um problema que não existe num bot comum: **duas pessoas escrevem do mesmo
-lado da conversa.**
+O cliente não troca de número nem para de usar o WhatsApp no celular: a dona da
+clínica responde pelo aplicativo dela e a assistente responde no mesmo número —
+o modo **Coexistence** da plataforma oficial. Isso cria um problema que um bot
+comum não tem: **duas pessoas escrevem do mesmo lado da conversa.**
+
+```mermaid
+flowchart LR
+    DONA([Dona responde pelo app dela]) --> ECHO[echo chega ao webhook]
+    ECHO --> MEU{e o proprio envio da assistente?}
+    MEU -->|sim| IGN[ignora, para nao se silenciar sozinha]
+    MEU -->|nao| CALA[silencia o contato por 15 min]
+    CALA --> MARCA[grava a fala com a marca de autoria]
+    MARCA --> HIST[(historico)]
+    HIST --> SOFIA([a assistente le e sabe de quem foi cada linha])
+```
 
 A plataforma entrega a fala da dona num campo diferente do da mensagem do
 cliente (`smb_message_echoes` em vez de `messages`). Três coisas acontecem
@@ -311,11 +296,10 @@ quando ela chega:
    conversa é uma pessoa; falar por cima é pior que ficar quieto.
 3. **A fala da dona entra no histórico com uma marca de autoria.**
 
-A marca é o detalhe que faz o resto funcionar. Para o modelo, a dona e a
-assistente são o mesmo lado da conversa — gravar a fala da dona como se fosse do
-cliente ensinaria a assistente que o cliente disse o que a dona disse. Mas
-*dentro* desse lado, sem marca, ela não distingue uma promessa própria de uma
-frase da dona:
+A marca é o que faz o resto funcionar. Gravar a fala da dona como se fosse do
+cliente ensinaria a assistente que o cliente disse o que a dona disse; mantê-la
+do lado da assistente, sem marca, faz a assistente confundir promessa da dona
+com promessa própria.
 
 ```js
 export const MARCA_ATENDIMENTO = '[mensagem enviada pelo atendimento]';
@@ -326,26 +310,23 @@ export function comMarcaDeAtendimento(texto) {
 ```
 
 Duas linhas, e a disciplina está no que elas **não** afirmam: a marca diz quem
-escreveu aquela linha, e nada além disso. Não afirma que o horário citado ali
-existe, não afirma que não existe, não enumera tipo de mensagem. O módulo é
-folha — não importa nada — porque quem monta o prompt de sistema o consome, e a
-constante e a instrução não podem divergir: a instrução **interpola** a
-constante em vez de repetir o texto.
+escreveu aquela linha e nada mais — não afirma que o horário citado existe, nem
+que não existe. O módulo é folha porque quem monta o prompt de sistema o
+consome, e a instrução **interpola** a constante em vez de repetir o texto:
+marca e instrução não têm como divergir.
 
-A instrução, presente só para tenant em Coexistence, fecha o caso que motivou
+A instrução existe só para tenant em Coexistence e fecha o caso que motivou
 tudo: se numa linha marcada a pessoa ofereceu um horário e o cliente aceita
-("pode ser", "confirmado então"), a assistente **não confirma** — ela chama a
+("pode ser", "confirmado então"), a assistente **não confirma** — chama a
 ferramenta de atendente humano e avisa que a equipe assume. Ela não agenda o que
 não foi ela quem ofereceu e verificou.
 
 **Como sei que funciona.** O cenário `17-marca-de-autoria-do-dono` do
-[`sofia-eval`](https://github.com/andrenv14/sofia-eval) foi escrito para nascer
-VERMELHO: a dona oferece um horário, o cliente diz "confirmado então", e a
-assistente confirmava um horário que nunca ofereceu nem verificou — três
-passadas, mesmo resultado. Depois da marca: verde em três passadas, com a
-pendência de atendimento humano registrada no banco. E o mesmo cenário rodado
-contra o código anterior continua vermelho — o controle que separa "a correção
-funcionou" de "o modelo teve um dia bom".
+`sofia-eval` foi escrito para nascer VERMELHO, e nasceu: em três passadas a
+assistente confirmou um horário que nunca ofereceu nem verificou. Depois da
+marca, verde em três passadas, com a pendência de atendimento humano gravada no
+banco — e o mesmo cenário contra o código anterior continua vermelho, que é o
+controle separando "a correção funcionou" de "o modelo teve um dia bom".
 
 ## 5. Dados e operação como propriedades
 
@@ -377,6 +358,27 @@ de desenvolvimento roda a suíte e o avaliador de comportamento, e **não tem
 nenhuma credencial de produção** — token da plataforma falso, banco de teste,
 chave de LLM com teto próprio. Nada que vaze de um lado alcança o outro.
 
+```mermaid
+flowchart TB
+    subgraph DEV[Desenvolvimento: sem credencial de producao]
+        FATIA[Sessao de fatia: plano aprovado, working tree proprio]
+        SUITE[Suite Vitest contra Postgres real]
+        EVAL[sofia-eval: IA real, julga pelo efeito no banco]
+    end
+    subgraph PROD[VPS: producao]
+        GUIA[Sessao-guia: orquestra, mede, faz merge e deploy]
+        FILTROS[Filtros em sequencia: revisor, conferidor, prova negativa]
+        CODEX[Revisor independente: outro fornecedor]
+    end
+    FATIA --> SUITE
+    FATIA -->|branch| GUIA
+    GUIA --> FILTROS
+    FILTROS --> CODEX
+    CODEX -->|bloqueador| FATIA
+    CODEX -->|apto a deploy| MERGE[merge, deploy, log conferido]
+    EVAL -->|verde ou vermelho| GUIA
+```
+
 **Papéis fixos, e nenhum acumula dois.**
 
 | Papel | O que faz | O que nunca faz |
@@ -387,32 +389,30 @@ chave de LLM com teto próprio. Nada que vaze de um lado alcança o outro.
 | Subagentes | revisor de diff, conferidor de citações, prova negativa, auditores de infra e de documentação | decidir merge |
 | Revisor independente | **outro modelo, de outro fornecedor**: lê a branch inteira e declara "apto a deploy" ou devolve o bloqueador | implementar qualquer coisa |
 
-**As regras que fazem o arranjo valer alguma coisa.** Cada uma existe porque a
-ausência dela deixou passar algo:
+**As regras que fazem o arranjo valer alguma coisa.** Nenhuma é preferência:
+cada uma existe porque a ausência dela deixou passar algo.
 
-- **Quem implementa não se auto-revisa, e concordar não é corroborar.** Dois
-  agentes que leram o mesmo código com o mesmo ponto cego não são duas fontes.
-  Duas fontes só contam quando podiam discordar.
+- **Concordar não é corroborar.** Dois agentes que leram o mesmo código com o
+  mesmo ponto cego são uma fonte contada duas vezes. Duas fontes só contam
+  quando podiam discordar.
 - **Medição que sustenta um merge carrega o commit e o estado da árvore no
-  cabeçalho.** Um número sem isso não se liga ao código que vai ao ar — e quando
-  uma medição precisa ser reaproveitada entre dois commits, o que autoriza é o
-  hash da árvore de `src/`, não a leitura da mensagem do commit.
+  cabeçalho** — sem isso o número não se liga ao código que vai ao ar. Para
+  reaproveitar uma medição entre dois commits, o que autoriza é o hash da
+  árvore de `src/`, não a mensagem do commit.
 - **Texto durável cita arquivo e nome de função, nunca número de linha.** Nome
-  sobrevive a deslocamento; linha envelhece em silêncio. Contagem em comentário
-  vem com o comando que a rederiva, ou não entra.
+  sobrevive a deslocamento; linha envelhece em silêncio. Contagem só entra com
+  o comando que a rederiva.
 - **Verificação que passa observando nada precisa primeiro ser vista falhar.**
-  "Nenhum agendamento criado" é satisfeito tanto pelo acerto quanto pelo sistema
-  não ter rodado. Antes de aceitar uma asserção dessas, quebra-se o código de
-  propósito para vê-la ficar vermelha.
-- **A terceira correção seguida na mesma classe não vira quarta: vira
-  redesenho.** Remendo que precisa de remendo é sintoma de desenho errado.
-- **Os filtros rodam em sequência, nunca em paralelo** — disputam working tree,
-  banco de teste e porta.
+  "Nenhum agendamento criado" é satisfeito pelo acerto e também pelo sistema não
+  ter rodado: quebra-se o código de propósito para ver a asserção ficar vermelha.
+- **A terceira correção seguida na mesma classe vira redesenho, não quarta
+  correção.**
+- **Os filtros rodam em sequência** — disputam working tree, banco de teste e
+  porta.
 
 **O deploy segue roteiro escrito**: suíte verde antes, commit antes da migration,
-reinício só depois, e o log do processo no ar conferido depois — não a suíte de
-novo, que testaria outra vez o mesmo código em vez do processo que está
-atendendo.
+reinício depois, e então o log do processo no ar — não a suíte de novo, que
+testaria o mesmo código em vez do processo que está atendendo.
 
 ## 7. O que ficou de fora, e por quê
 
