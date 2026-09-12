@@ -103,10 +103,10 @@ Cinco decisões definem o sistema. Cada uma tem um porquê e um custo aceito.
 
 ## 3. Como sei que funciona
 
-**A suíte prova o encanamento.** São 47 arquivos e 694 testes (Vitest) contra
-um **Postgres real**. Só a IA e a API da Meta são simuladas. O número se
-rederiva com `npm test`; ele muda a cada fatia de trabalho, e por isso não vive
-em comentário de código. Os arquivos rodam um de cada vez
+**A suíte prova o encanamento.** São mais de 700 testes (Vitest) contra um
+**Postgres real**. Só a IA e a API da Meta são simuladas. O número exato se
+rederiva com `npm test` e muda a cada fatia de trabalho — por isso ele não fica
+fixado aqui nem em comentário de código. Os arquivos rodam um de cada vez
 (`fileParallelism: false`): os testes provam concorrência de verdade, então não
 podem competir entre si por engano.
 
