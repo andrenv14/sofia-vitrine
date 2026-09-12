@@ -19,7 +19,7 @@ comportamento, é público e roda ·
 
 ## 1. O que é, e a prova de que está no ar
 
-Em produção desde **08/08/2026**, numa VPS própria (um servidor virtual
+Em produção desde **agosto de 2026**, numa VPS própria (um servidor virtual
 alugado), recebendo e respondendo tráfego real pela **API oficial** do WhatsApp
 (WhatsApp Business Platform). Nunca por automação do WhatsApp Web.
 
@@ -94,9 +94,9 @@ Cinco decisões definem o sistema. Cada uma tem um porquê e um custo aceito.
    senão o reenvio inflaria o contador.
 4. **A fila não apaga, troca status** (`pendente → processando → concluida |
    erro`). Linha com erro continua elegível para reprocesso no próximo boot:
-   mensagem de cliente não se perde por causa de um deploy. Custo: reiniciar
-   reprocessa o que ficou no meio, o que já reacendeu um laço pausado. Virou
-   regra de operação escrita.
+   mensagem de cliente não se perde por causa de um deploy. Custo, e ele é
+   medido e não hipotético: reiniciar reprocessa o que ficou no meio, e isso
+   reacende laço pausado — a operação tem regra escrita para o caso.
 5. **Um processo, uma máquina.** Para dezenas de negócios de agendamento o
    gargalo não é CPU, é acertar a concorrência. Custo declarado: uns segundos
    fora do ar no reinício, amenizados pela fila.
@@ -170,10 +170,10 @@ buffers de tamanhos diferentes lançam erro, e isso não pode virar um 500.
 ### Guarda contra laço: janela deslizante com pausa que se desfaz sozinha
 
 Existe porque aconteceu: dois bots conversando entre si, milhares de mensagens
-até alguém notar. Está em produção desde 23/08/2026, e no mesmo dia cortou um
-laço real em 22 minutos: 61 chamadas ao modelo, 534.728 tokens. Medido depois:
-58,7% do gasto daquele dia, e o dia inteiro foi 1,65% do gasto do mês. O número
-assusta menos do que parece, e publico assim mesmo.
+até alguém notar. No mesmo dia em que entrou, cortou um laço real em 22 minutos:
+61 chamadas ao modelo, 534.728 tokens. Medido depois: 58,7% do gasto daquele
+dia, e o dia inteiro foi 1,65% do gasto do mês. O número assusta menos do que
+parece, e publico assim mesmo.
 
 ```js
 const LOOP_MAX_MSGS = 35;        // rajada: 35 msgs em 120s
